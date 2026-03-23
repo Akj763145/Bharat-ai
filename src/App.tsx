@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, User, Sparkles, X, AlertCircle, Menu, History, MessageSquare, FileText, File } from 'lucide-react';
+import { Send, User, Sparkles, X, AlertCircle, Menu, History, MessageSquare, FileText, File, LogIn, LogOut } from 'lucide-react';
 import { GoogleGenAI } from '@google/genai';
+import { getSupabase } from './supabaseClient';
 
 // Custom Icons
 const TwoDots = ({ size = 24, className = "" }: { size?: number, className?: string }) => (
@@ -52,6 +53,11 @@ export default function App() {
   const [appTitle, setAppTitle] = useState('Bharat AI');
   const [systemPrompt, setSystemPrompt] = useState('You are a warm, conversational, and culturally aware AI assistant from Bharat. Always provide answers that are highly humanized, natural, and easy to understand. Avoid robotic jargon. Make your responses interactive by occasionally asking relevant follow-up questions to keep the conversation engaging.');
 
+  // Supabase Auth State
+  const [session, setSession] = useState<any>(null);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -63,6 +69,87 @@ export default function App() {
   useEffect(() => {
     scrollToBottom();
   }, [messages, isLoading]);
+
+  // Supabase Auth Effect
+  useEffect(() => {
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    // Initial session check
+    const initAuth = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      setSession(session);
+      if (session) {
+        await fetchChatHistory(session.user.id);
+      }
+    };
+    
+    initAuth();
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange(async (event, session) => {
+      console.log('Auth event:', event);
+      setSession(session);
+      if (session && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION')) {
+        await fetchChatHistory(session.user.id);
+      } else if (event === 'SIGNED_OUT') {
+        setMessages([{ role: 'model', text: 'Namaste! I am your AI assistant. How can I help you today?' }]);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const fetchChatHistory = async (userId: string) => {
+    const supabase = getSupabase();
+    if (!supabase) return;
+
+    console.log('Fetching chat history for user:', userId);
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching chat history:', error);
+      setError(`Failed to load history: ${error.message}. Make sure you have run the SQL setup in Supabase.`);
+      return;
+    }
+
+    console.log('Fetched messages:', data?.length || 0);
+    if (data && data.length > 0) {
+      const formattedMessages: Message[] = data.map(m => ({
+        role: m.role as 'user' | 'model',
+        text: m.content,
+        file: m.file_url ? {
+          url: m.file_url,
+          data: '', 
+          mimeType: m.file_type || '',
+          name: m.file_name || '',
+          isImage: m.file_type?.startsWith('image/') || false
+        } : null
+      }));
+      setMessages(formattedMessages);
+    }
+  };
+
+  const saveMessageToSupabase = async (msg: Message) => {
+    const supabase = getSupabase();
+    if (!supabase || !session) return;
+
+    const { error } = await supabase.from('messages').insert({
+      user_id: session.user.id,
+      role: msg.role,
+      content: msg.text,
+      file_name: msg.file?.name,
+      file_type: msg.file?.mimeType,
+      file_url: msg.file?.url // Note: In a real app, you'd upload to Supabase Storage first
+    });
+
+    if (error) console.error('Error saving message:', error);
+  };
 
   // Flip animation timer for the title
   useEffect(() => {
@@ -113,6 +200,7 @@ export default function App() {
     const updatedMessages = [...messages, userMessage];
     
     setMessages(updatedMessages);
+    if (session) saveMessageToSupabase(userMessage);
     setInput('');
     setAttachedFile(null);
     setIsLoading(true);
@@ -148,7 +236,9 @@ export default function App() {
       
       const aiResponseText = response.text || '';
       
-      setMessages(prev => [...prev, { role: 'model', text: aiResponseText }]);
+      const modelMessage: Message = { role: 'model', text: aiResponseText };
+      setMessages(prev => [...prev, modelMessage]);
+      if (session) saveMessageToSupabase(modelMessage);
     } catch (err: any) {
       setError(err.message || 'An error occurred');
       setMessages(prev => prev.slice(0, -1)); // Remove the failed message
@@ -163,6 +253,32 @@ export default function App() {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSendMessage();
+    }
+  };
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const supabase = getSupabase();
+    if (!supabase) {
+      alert('Supabase configuration is missing. Please set your secrets.');
+      return;
+    }
+    setAuthLoading(true);
+    try {
+      const { error } = await supabase.auth.signInWithOtp({ email: authEmail });
+      if (error) throw error;
+      alert('Check your email for the login link!');
+    } catch (error: any) {
+      alert(error.error_description || error.message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    const supabase = getSupabase();
+    if (supabase) {
+      await supabase.auth.signOut();
     }
   };
 
@@ -204,6 +320,43 @@ export default function App() {
           >
             <X size={20} />
           </button>
+        </div>
+
+        {/* Auth Section */}
+        <div className="px-6 pb-4 border-b border-slate-100 mb-4">
+          {session ? (
+            <div className="flex items-center justify-between bg-slate-50 p-3 rounded-xl border border-slate-100">
+              <div className="flex flex-col overflow-hidden">
+                <span className="text-xs font-bold text-slate-400 uppercase">Logged in as</span>
+                <span className="text-sm font-semibold text-slate-700 truncate">{session.user.email}</span>
+              </div>
+              <button onClick={handleLogout} className="p-2 text-slate-400 hover:text-red-500 transition-colors" title="Logout">
+                <LogOut size={18} />
+              </button>
+            </div>
+          ) : (
+            <form onSubmit={handleLogin} className="flex flex-col gap-2">
+              <span className="text-xs font-bold text-slate-400 uppercase">Account</span>
+              <div className="flex gap-2">
+                <input
+                  type="email"
+                  placeholder="Enter email to login"
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  className="flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-[#FF9933]/50"
+                  required
+                />
+                <button
+                  type="submit"
+                  disabled={authLoading}
+                  className="bg-[#000080] text-white px-3 py-2 rounded-lg text-sm font-medium hover:bg-[#1a1a9e] transition-colors disabled:opacity-50 flex items-center justify-center min-w-[40px]"
+                  title="Login with Magic Link"
+                >
+                  {authLoading ? '...' : <LogIn size={18} />}
+                </button>
+              </div>
+            </form>
+          )}
         </div>
 
         <div className="px-6 pb-6 flex-1 overflow-y-auto space-y-2">
